@@ -350,13 +350,99 @@ def training(dataset, opt, pipe, args, calib_mgr):
         # 这样Scene就不会加载points3D.ply，而是使用checkpoint中的点云
         print(f"\n[关键修复] 先从checkpoint恢复点云，再创建Scene")
         
+        # 关键修复：临时修改cameras_extent，禁用Scene的归一化
+        # 因为checkpoint中的点云已经是归一化后的了
+        print(f"\n[关键修复] 禁用Scene归一化（checkpoint已归一化）")
+        
         # 临时创建一个dummy scene来获取相机（不加载点云）
-        # 我们需要相机信息来设置training_setup
+        # 通过设置一个小的cameras_extent来禁用归一化
+        import scene.dataset_readers as dr
+        original_load_func = dr.sceneLoadTypeCallbacks["Satellite"]
+        
+        def patched_load_func(*args, **kwargs):
+            scene_info = original_load_func(*args, **kwargs)
+            # 修改nerf_normalization，设置一个小的radius来禁用归一化
+            scene_info = scene_info._replace(
+                nerf_normalization={'translate': scene_info.nerf_normalization['translate'], 
+                                   'radius': 50.0}  # 小于120，禁用归一化
+            )
+            return scene_info
+        
+        dr.sceneLoadTypeCallbacks["Satellite"] = patched_load_func
+        
         temp_scene = Scene(dataset, gaussians, load_iteration=None, shuffle=False)
+        
+        # 恢复原始函数
+        dr.sceneLoadTypeCallbacks["Satellite"] = original_load_func
+        
         train_cameras = temp_scene.getTrainCameras()
         test_cameras = temp_scene.getTestCameras()
         print(f"训练相机: {len(train_cameras)}")
         print(f"测试相机: {len(test_cameras)}")
+        print(f"Scene extent: {temp_scene.cameras_extent}")
+        
+        # 专家建议：应用 Task 1 的 Sim(3) 到相机
+        if args.use_ckpt_sim3:
+            import json
+            
+            # 读取 Sim(3) 参数
+            sim3 = None
+            if args.sim3_json and os.path.exists(args.sim3_json):
+                with open(args.sim3_json) as f:
+                    sim3 = json.load(f)
+                print(f"\n[SIM3] 从 JSON 读取: {args.sim3_json}")
+            else:
+                raise ValueError("--use_ckpt_sim3 但找不到 sim3 参数文件")
+            
+            # 应用 Sim(3) 到相机
+            mu = np.array(sim3["center"], dtype=np.float32)
+            s = float(sim3["scale"])
+            
+            print(f"[SIM3] 应用 Task 1 的归一化到相机")
+            print(f"  center μ: [{mu[0]:.2f}, {mu[1]:.2f}, {mu[2]:.2f}]")
+            print(f"  scale s: {s:.6f}")
+            print(f"  extent: {sim3['extent_before']:.2f} → {sim3['extent_after']:.2f}")
+            
+            # 对所有相机应用变换
+            from utils.graphics_utils import getWorld2View2
+            for cam in train_cameras + test_cameras:
+                # 相机变换：t' = s * t + s * (R @ μ)
+                R = np.array(cam.R) if not isinstance(cam.R, np.ndarray) else cam.R
+                t = np.array(cam.T) if not isinstance(cam.T, np.ndarray) else cam.T
+                
+                # 完整相似变换
+                t_new = s * t + s * (R @ mu)
+                cam.T = t_new
+                
+                # 重新计算 world_view_transform
+                cam.world_view_transform = torch.tensor(
+                    getWorld2View2(cam.R, cam.T, cam.trans, cam.scale)
+                ).transpose(0, 1).cuda()
+                
+                # 重新计算 camera_center
+                cam.camera_center = cam.world_view_transform.inverse()[3, :3]
+                
+                # 重新计算 full_proj_transform
+                cam.full_proj_transform = (
+                    cam.world_view_transform.unsqueeze(0).bmm(cam.projection_matrix.unsqueeze(0))
+                ).squeeze(0)
+                
+                # 归一化 Near/Far
+                if hasattr(cam, 'znear'):
+                    cam.znear = cam.znear * s
+                if hasattr(cam, 'zfar'):
+                    cam.zfar = cam.zfar * s
+            
+            print(f"[SIM3] ✅ 已应用到 {len(train_cameras) + len(test_cameras)} 个相机")
+            
+            # 打印第一个相机的参数验证
+            if len(train_cameras) > 0:
+                cam0 = train_cameras[0]
+                print(f"[SIM3] 验证相机 0:")
+                print(f"  camera_center: {cam0.camera_center.cpu().numpy()}")
+                print(f"  T: {cam0.T}")
+                if hasattr(cam0, 'znear') and hasattr(cam0, 'zfar'):
+                    print(f"  znear: {cam0.znear:.2f}, zfar: {cam0.zfar:.2f}")
         
         # 背景颜色
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -369,6 +455,18 @@ def training(dataset, opt, pipe, args, calib_mgr):
         gaussians, loaded_iter = load_ckpt_strict(gaussians, args.task1_ckpt, opt, "cuda")
         print(f"  从iteration {loaded_iter}恢复")
         print(f"  ✅ 点云已从checkpoint恢复: {gaussians.get_xyz.shape[0]} 点")
+        
+        # 1.5) 检查checkpoint点云尺度
+        xyz = gaussians._xyz
+        center = xyz.mean(dim=0)
+        max_dist = (xyz - center).norm(dim=1).max()
+        current_extent = max_dist * 2
+        
+        print(f"\n[INFO] Checkpoint点云尺度")
+        print(f"  点云中心: {center.detach().cpu().numpy()}")
+        print(f"  当前extent: {current_extent:.2f}")
+        print(f"  点云范围: [{gaussians._xyz.min().item():.2f}, {gaussians._xyz.max().item():.2f}]")
+        print(f"  ✅ Checkpoint点云已是归一化后的，无需再次归一化")
         
         # 2) 失效所有缓存并强制重建过滤
         print(f"\n[专家建议] 失效缓存并重建filter_3D")
@@ -396,6 +494,55 @@ def training(dataset, opt, pipe, args, calib_mgr):
         
         # 保存scene引用（虽然点云已被checkpoint覆盖）
         scene = temp_scene
+        
+        # Sanity Only 模式：只渲染一帧后退出
+        if args.sanity_only:
+            print(f"\n[SANITY ONLY] 模式：只渲染一帧后退出")
+            
+            # 渲染第一个相机
+            cam = train_cameras[0]
+            with torch.no_grad():
+                render_out = render(cam, gaussians, pipe, background, kernel_size=0.1)
+                rgb_lin = render_out["render"]
+                
+                # 统计
+                rgb_max = float(rgb_lin.max().item())
+                rgb_min = float(rgb_lin.min().item())
+                rgb_mean = float(rgb_lin.mean().item())
+                
+                alpha = render_out.get("alpha", None)
+                if alpha is None:
+                    alpha = render_out.get("accumulation", None)
+                if alpha is not None:
+                    alpha_mean = float(alpha.mean().item())
+                else:
+                    alpha_mean = 0.0
+                
+                print(f"\n[SANITY] 渲染统计:")
+                print(f"  rgb_min: {rgb_min:.6f}")
+                print(f"  rgb_max: {rgb_max:.6f}")
+                print(f"  rgb_mean: {rgb_mean:.6f}")
+                print(f"  alpha_mean: {alpha_mean:.6f}")
+                
+                # 保存可视化
+                from utils.visualization import linear_to_srgb_safe
+                rgb_np = rgb_lin.clamp(0, 1).cpu().numpy().transpose(1, 2, 0)
+                rgb_srgb = linear_to_srgb_safe(rgb_np)
+                save_path = output_dir / "sanity_check.png"
+                save_rgb(torch.from_numpy(rgb_srgb.transpose(2, 0, 1)), str(save_path))
+                print(f"\n[SANITY] 可视化已保存: {save_path}")
+                
+                # 判断是否通过
+                if rgb_max > 0.3 and rgb_max < 1.5 and alpha_mean > 0.2:
+                    print(f"\n[SANITY] ✅ 通过检查！")
+                    print(f"  - rgb_max ∈ [0.3, 1.5]: ✅")
+                    print(f"  - alpha_mean > 0.2: ✅")
+                    return None
+                else:
+                    print(f"\n[SANITY] ❌ 未通过检查！")
+                    print(f"  - rgb_max ∈ [0.3, 1.5]: {'✅' if 0.3 < rgb_max < 1.5 else '❌'}")
+                    print(f"  - alpha_mean > 0.2: {'✅' if alpha_mean > 0.2 else '❌'}")
+                    return None
     else:
         raise ValueError("❌ 必须指定--task1_ckpt！Stage C不支持从随机初始化开始训练")
     
@@ -762,6 +909,11 @@ def main():
     parser.add_argument('--color_calib_dir', type=str, default='', help='Stage B参数目录')
     parser.add_argument('--task1_ckpt', type=str, default='', help='Task 1训练好的模型路径（.ply或checkpoint）')
     parser.add_argument('--freeze_3dgs_iters', type=int, default=50, help='冻结3DGS的迭代数（专家建议：30-50）')
+    
+    # Sim(3) 归一化参数（专家建议：对齐 Task 1 的坐标系）
+    parser.add_argument('--use_ckpt_sim3', action='store_true', help='使用 Task 1 checkpoint 的 Sim(3) 参数')
+    parser.add_argument('--sim3_json', type=str, default='', help='Sim(3) 参数 JSON 文件路径')
+    parser.add_argument('--sanity_only', action='store_true', help='只运行 Sanity Check，不训练')
     
     # 正则化参数
     parser.add_argument('--calib_reg_lambda', type=float, default=1e-3, help='||M-I||_F^2系数')

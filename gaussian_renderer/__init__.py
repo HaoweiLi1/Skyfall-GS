@@ -114,7 +114,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
         dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
         colors_toned = eval_sh(pc.active_sh_degree, colors_toned, dir_pp_normalized)
-        colors_toned = torch.clamp_min(colors_toned + 0.5, 0.0)
+        # 修复：添加上界限制，确保输出在 [0, 1]
+        colors_toned = torch.clamp(colors_toned + 0.5, 0.0, 1.0)
         colors_precomp = colors_toned
     elif override_color is None:
         if pipe.convert_SHs_python:
@@ -122,7 +123,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
-            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+            # 修复：添加上界限制，确保输出在 [0, 1]
+            colors_precomp = torch.clamp(sh2rgb + 0.5, 0.0, 1.0)
         else:
             shs = pc.get_features
     else:
