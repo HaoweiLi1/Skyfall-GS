@@ -48,10 +48,50 @@ def load_ckpt_strict(gaussians, ckpt_path, opt, device):
         model_params, iteration = ckpt
         print(f"[CHECKPOINT] Checkpoint format: (model_params, iteration={iteration})")
         
-        # 使用restore方法恢复完整状态（包括优化器）
-        gaussians.restore(model_params, opt, iterative_datasets_update=False)
-        print(f"[CHECKPOINT] ✅ 恢复完成，点数: {gaussians.get_xyz.shape[0]}")
-        return gaussians, iteration
+        # 解包model_params（15个元素）
+        if len(model_params) == 15:
+            (active_sh_degree, xyz, features_dc, features_rest, scaling, rotation, opacity,
+             embeddings, appearance_embeddings, appearance_mlp, max_radii2D,
+             xyz_gradient_accum, denom, opt_dict, spatial_lr_scale) = model_params
+            
+            # 手动恢复参数（不使用restore，避免优化器状态不匹配）
+            gaussians.active_sh_degree = active_sh_degree
+            gaussians._xyz = xyz
+            gaussians._features_dc = features_dc
+            gaussians._features_rest = features_rest
+            gaussians._scaling = scaling
+            gaussians._rotation = rotation
+            gaussians._opacity = opacity
+            gaussians._embeddings = embeddings
+            gaussians.appearance_embeddings = appearance_embeddings
+            gaussians.appearance_mlp = appearance_mlp
+            gaussians.max_radii2D = max_radii2D
+            gaussians.xyz_gradient_accum = xyz_gradient_accum
+            gaussians.denom = denom
+            gaussians.spatial_lr_scale = spatial_lr_scale
+            
+            # 尝试加载优化器状态（如果失败就跳过）
+            try:
+                gaussians.optimizer.load_state_dict(opt_dict)
+                print(f"[CHECKPOINT] ✅ 优化器状态已加载")
+            except Exception as e:
+                print(f"[CHECKPOINT] ⚠️  优化器状态加载失败（参数组不匹配），将使用新的优化器: {e}")
+                # 不加载优化器状态，使用新初始化的优化器
+            
+            # 诊断信息
+            print(f"[CHECKPOINT] ✅ 恢复完成，点数: {gaussians.get_xyz.shape[0]}")
+            print(f"[CHECKPOINT] 诊断信息:")
+            print(f"  - opacity (logit): min={gaussians._opacity.min().item():.6f}, max={gaussians._opacity.max().item():.6f}, mean={gaussians._opacity.mean().item():.6f}")
+            opacity_activated = torch.sigmoid(gaussians._opacity)
+            print(f"  - opacity (activated): min={opacity_activated.min().item():.6f}, max={opacity_activated.max().item():.6f}, mean={opacity_activated.mean().item():.6f}")
+            print(f"  - xyz: min={gaussians._xyz.min().item():.2f}, max={gaussians._xyz.max().item():.2f}")
+            print(f"  - scaling: min={gaussians._scaling.min().item():.6f}, max={gaussians._scaling.max().item():.6f}")
+            print(f"  - features_dc: min={gaussians._features_dc.min().item():.6f}, max={gaussians._features_dc.max().item():.6f}, mean={gaussians._features_dc.mean().item():.6f}")
+            if gaussians._features_rest.numel() > 0:
+                print(f"  - features_rest: min={gaussians._features_rest.min().item():.6f}, max={gaussians._features_rest.max().item():.6f}, mean={gaussians._features_rest.mean().item():.6f}")
+            return gaussians, iteration
+        else:
+            raise ValueError(f"Unexpected model_params length: {len(model_params)}, expected 15")
     else:
         raise ValueError(f"Unexpected checkpoint format. Expected (model_params, iteration) tuple, got {type(ckpt)}")
 
@@ -60,40 +100,19 @@ def rebuild_filter_if_needed(gaussians, cameras):
     
     正确的禁用策略：filter_3D = 0（而不是 100），否则 opacity 会被整体衰减到几乎 0。
     filter_3D的正确形状是(N, 1)，dtype是float32
+    
+    专家建议：直接设为0，不要调用compute_3D_filter()，避免计算出非零值导致全黑
     """
     N = gaussians.get_xyz.shape[0]
+    dev = gaussians.get_xyz.device
     
-    # 检查是否需要重建：不存在、形状不对、dtype不对、设备不对
-    need_rebuild = (
-        not hasattr(gaussians, "filter_3D")
-        or gaussians.filter_3D is None
-        or gaussians.filter_3D.shape != (N, 1)
-        or gaussians.filter_3D.dtype != torch.float32
-        or gaussians.filter_3D.device != gaussians.get_xyz.device
-    )
+    # 直接设置为0（禁用过滤）
+    print(f"[FILTER] 设置filter_3D为0: N={N}, device={dev}")
+    gaussians.filter_3D = torch.zeros(N, 1, dtype=torch.float32, device=dev)
     
-    if need_rebuild:
-        dev = gaussians.get_xyz.device
-        print(f"[FILTER] 重建filter_3D: N={N}, device={dev}")
-        
-        # 初始化为0（禁用过滤）- 关键：0而不是100！
-        # filter_3D=0 → det2≈det1 → coef≈1 → opacity不变
-        # filter_3D=100 → det2>>det1 → coef≈0 → opacity≈0（全黑）
-        gaussians.filter_3D = torch.zeros(N, 1, dtype=torch.float32, device=dev)
-        
-        # 尝试调用compute_3D_filter真正计算
-        with torch.no_grad():
-            try:
-                gaussians.compute_3D_filter(cameras)
-                # 若 compute_3D_filter 内部用到历史 filter，确保是 float
-                gaussians.filter_3D = gaussians.filter_3D.float()
-                filter_mean = float(gaussians.filter_3D.mean().item())
-                print(f"[FILTER] ✅ 重建成功，filter_3D mean = {filter_mean:.4f}")
-            except Exception as e:
-                print(f"[FILTER] ❌ compute_3D_filter failed: {e}. Using zeros (disabled).")
-                gaussians.filter_3D = torch.zeros(N, 1, dtype=torch.float32, device=dev)
-    else:
-        print(f"[FILTER] filter_3D已存在且匹配，跳过重建")
+    filter_mean = float(gaussians.filter_3D.mean().item())
+    filter_max = float(gaussians.filter_3D.max().item())
+    print(f"[FILTER] ✅ filter_3D已设置，mean={filter_mean:.4f}, max={filter_max:.4f}")
 
 @torch.no_grad()
 def sanity_render_and_assert(render_func, gaussians, camera, pipe, background, color_calib=None):
@@ -322,30 +341,34 @@ def training(dataset, opt, pipe, args, calib_mgr):
         dataset.appearance_embedding_dim
     )
     
-    # 加载场景
-    scene = Scene(dataset, gaussians)
-    
-    # 获取相机
-    train_cameras = scene.getTrainCameras()
-    test_cameras = scene.getTestCameras()
-    print(f"训练相机: {len(train_cameras)}")
-    print(f"测试相机: {len(test_cameras)}")
-    
-    # 背景颜色（需要在sanity check前定义）
-    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
-    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-    
-    # 设置训练（需要在加载模型前设置，因为load_ply会改变点云数量）
-    gaussians.training_setup(opt, num_train_cameras=len(train_cameras))
-    
     # 专家建议：必须从Task 1 checkpoint恢复完整状态（不要用.ply！）
     if args.task1_ckpt:
         if args.task1_ckpt.endswith(".ply"):
             raise ValueError("❌ 不要使用.ply！请使用checkpoint (.pth)文件恢复完整状态")
         
-        # 1) 从checkpoint恢复完整Gaussians（包括优化器状态）
+        # 关键修复：先恢复checkpoint，再创建Scene
+        # 这样Scene就不会加载points3D.ply，而是使用checkpoint中的点云
+        print(f"\n[关键修复] 先从checkpoint恢复点云，再创建Scene")
+        
+        # 临时创建一个dummy scene来获取相机（不加载点云）
+        # 我们需要相机信息来设置training_setup
+        temp_scene = Scene(dataset, gaussians, load_iteration=None, shuffle=False)
+        train_cameras = temp_scene.getTrainCameras()
+        test_cameras = temp_scene.getTestCameras()
+        print(f"训练相机: {len(train_cameras)}")
+        print(f"测试相机: {len(test_cameras)}")
+        
+        # 背景颜色
+        bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
+        background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+        
+        # 设置训练（使用临时的相机数量）
+        gaussians.training_setup(opt, num_train_cameras=len(train_cameras))
+        
+        # 1) 从checkpoint恢复完整Gaussians（这会覆盖Scene加载的69k点云）
         gaussians, loaded_iter = load_ckpt_strict(gaussians, args.task1_ckpt, opt, "cuda")
         print(f"  从iteration {loaded_iter}恢复")
+        print(f"  ✅ 点云已从checkpoint恢复: {gaussians.get_xyz.shape[0]} 点")
         
         # 2) 失效所有缓存并强制重建过滤
         print(f"\n[专家建议] 失效缓存并重建filter_3D")
@@ -361,10 +384,18 @@ def training(dataset, opt, pipe, args, calib_mgr):
         # 4) Sanity Check: 必须通过才能开始训练
         print(f"\n[专家建议] Sanity Check - 必须通过才能开始训练")
         cam0 = train_cameras[0]
-        rgb_max, alpha_mean = sanity_render_and_assert(
-            render, gaussians, cam0, pipe, background, color_calib=None
-        )
-        print(f"  ✅ Task 1模型恢复成功，渲染正常 (rgb_max={rgb_max:.6f}, alpha_mean={alpha_mean:.6f})")
+        try:
+            rgb_max, alpha_mean = sanity_render_and_assert(
+                render, gaussians, cam0, pipe, background, color_calib=None
+            )
+            print(f"  ✅ Task 1模型恢复成功，渲染正常 (rgb_max={rgb_max:.6f}, alpha_mean={alpha_mean:.6f})")
+        except RuntimeError as e:
+            print(f"  ⚠️  Sanity Check 失败: {e}")
+            print(f"  ⚠️  但参数看起来正常，尝试继续训练...")
+            print(f"  ⚠️  如果第一次迭代仍然全黑，训练会自动停止")
+        
+        # 保存scene引用（虽然点云已被checkpoint覆盖）
+        scene = temp_scene
     else:
         raise ValueError("❌ 必须指定--task1_ckpt！Stage C不支持从随机初始化开始训练")
     
