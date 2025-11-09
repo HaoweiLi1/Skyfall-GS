@@ -298,14 +298,45 @@ class GaussianModel:
             if focal_length < camera.focal_x:
                 focal_length = camera.focal_x
         
-        distance[~valid_points] = distance[valid_points].max()
+        # === CRITICAL: Robust handling of empty valid_points mask ===
+        # Expert recommendation: Skip update entirely when all points invalid
+        # This prevents writing bad radii (0 or near-0) that would cause
+        # subsequent densify/prune to mark all points as invalid
+        
+        if not valid_points.any():
+            # All points invalid - SKIP UPDATE to preserve previous filter_3D
+            if not hasattr(self, "_warned_all_invalid") or not self._warned_all_invalid:
+                print("[WARN] compute_3D_filter: all points invalid; SKIPPING update to preserve previous filter_3D")
+                self._warned_all_invalid = True
+            # Early return - do NOT update self.filter_3D
+            return
+        
+        # Normal path: Update only valid points, use historical p90 for invalid
+        # Sanitize distance to avoid NaN/Inf
+        distance = torch.nan_to_num(distance, nan=1e8, posinf=1e8, neginf=1e8)
+        
+        # For valid points: use computed distance
+        # For invalid points: use historical p90 or max of valid points
+        if hasattr(self, 'filter_3D') and self.filter_3D is not None:
+            # Use historical p90 as fallback for invalid points
+            prev_filter = self.filter_3D.squeeze(-1).detach()
+            prev_valid = prev_filter[prev_filter > 0]
+            if len(prev_valid) > 0:
+                fallback = torch.quantile(prev_valid, 0.90)
+            else:
+                fallback = distance[valid_points].max()
+        else:
+            # First time: use max of valid points
+            fallback = distance[valid_points].max()
+        
+        # Apply: valid points get computed distance, invalid get fallback
+        distance[~valid_points] = fallback
         
         #TODO remove hard coded value
         #TODO box to gaussian transform
         filter_3D = distance / focal_length * (0.2 ** 0.5)
-        # filter_3D = distance / focal_length * 0.0  # TODO: disable 3D filter
         # convert to float32
-        self.filter_3D = filter_3D[..., None]
+        self.filter_3D = filter_3D[..., None].float()
         
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
@@ -321,14 +352,21 @@ class GaussianModel:
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
+        # === Step S1: Scale Rescue - 加大初始尺度 ===
+        # 专家建议: 投影半径太小（0.04px）导致无法覆盖像素
+        # 将初始尺度×2，让高斯能够"成像"
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
-        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+        SCALE_MULTIPLIER = 2.0  # 专家建议: ×2到×4
+        scales = torch.log(torch.sqrt(dist2) * SCALE_MULTIPLIER)[...,None].repeat(1, 3)
+        print(f"[RESCUE S1] Scale multiplier: {SCALE_MULTIPLIER}x (to increase projection radius)")
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
-        # TODO: make this a parameter
-        # Default: 0.1
-        # Satellite: 0.5
-        opacities = inverse_sigmoid(0.5 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        # === Step O1: Opacity Rescue - 提高初始不透明度 ===
+        # 专家建议: 让高斯"先看得见"，避免alpha_sum≈0
+        # 测试发现0.3会在100 iter后崩溃，尝试更高的值
+        INIT_OPACITY = 0.7  # 提高到0.7，防止模式崩溃
+        opacities = inverse_sigmoid(INIT_OPACITY * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        print(f"[RESCUE O1] Opacity initialized to {INIT_OPACITY} (was 0.5) for {fused_point_cloud.shape[0]} gaussians")
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))

@@ -173,6 +173,11 @@ class OptimizationParams(ParamGroup):
         self.lambda_depth: float = 0.5
         self.lambda_opacity: float = 0.1  # Entropy-based opacity regularization
         
+        # VGGT depth supervision (NEW)
+        self.lambda_vggt_depth: float = 0.5  # Weight for VGGT depth loss
+        self.vggt_depth_loss_type: str = "pearson"  # Options: 'pearson', 'silog', 'l1'
+        self.vggt_conf_min_quantile: float = 0.0  # Confidence quantile threshold (0.0 = no filter, 0.5 = filter bottom 50%)
+        
         # Appearance modeling learning rates
         self.embedding_lr: float = 0.005
         self.appearance_embedding_lr: float = 0.001
@@ -271,7 +276,7 @@ class OptimizationParams(ParamGroup):
         self.idu_flow_edit_n_max: int = 15
         self.idu_flow_edit_n_max_end: int = -1  # -1 means not using sampling
         self.idu_flow_edit_n_avg: int = 1
-        self.idu_model_type: str = "FLUX"
+        self.idu_model_type: str = "SD3"  # Changed from FLUX to SD3 (Stable Diffusion 3) - no gating required
     
     def _init_difix3d_params(self):
         """Initialize Difix3D parameters."""

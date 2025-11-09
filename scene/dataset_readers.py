@@ -22,13 +22,28 @@ from pathlib import Path
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
+from utils.color_space import srgb_to_linear_np, process_image_for_training
 import copy
 import OpenEXR
 
 class CameraInfo(NamedTuple):
+    """
+    Camera information container.
+    
+    Coordinate System Convention:
+    - R: Transposed world-to-camera rotation matrix (R_w2c.T)
+         Stored transposed for CUDA compatibility
+         Usage: R_w2c = cam.R.T, R_c2w = cam.R
+    - T: World-to-camera translation vector (t_w2c)
+         Usage: t_w2c = cam.T, t_c2w = -cam.R @ cam.T
+    
+    Depth Convention:
+    - depth: Depth map (may be in different resolution than image)
+    - depth_conf: Confidence map for depth (VGGT only, same size as depth)
+    """
     uid: int
-    R: np.array
-    T: np.array
+    R: np.array          # R_w2c.T (transposed for CUDA)
+    T: np.array          # t_w2c (world-to-camera translation)
     FovY: np.array
     FovX: np.array
     cx: np.array
@@ -37,6 +52,7 @@ class CameraInfo(NamedTuple):
     image_path: str
     image_name: str
     depth: np.array
+    depth_conf: np.array  # VGGT depth confidence (same size as depth)
     mask: np.array
     width: int
     height: int
@@ -128,7 +144,14 @@ def fetchPly(path):
     vertices = plydata['vertex']
     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
     colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
-    normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    
+    # Check if normals exist, if not create zero normals
+    if 'nx' in vertices and 'ny' in vertices and 'nz' in vertices:
+        normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    else:
+        print(f"[INFO] PLY file has no normals, creating zero normals")
+        normals = np.zeros_like(positions)
+    
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
 def storePly(path, xyz, rgb):
@@ -357,7 +380,312 @@ def readMultiScaleNerfSyntheticInfo(path, white_background, eval, load_allres=Fa
                            ply_path=ply_path)
     return scene_info
 
+def fill_point_cloud_colors_from_images(pcd, cameras, path):
+    """
+    为无颜色的点云从图像中采样颜色
+    
+    Args:
+        pcd: BasicPointCloud without colors
+        cameras: list of CameraInfo
+        path: scene directory
+    
+    Returns:
+        BasicPointCloud with colors
+    """
+    print("[INFO] Filling point cloud colors from images...")
+    
+    points = pcd.points
+    colors = np.zeros((len(points), 3), dtype=np.float32)
+    vis_mask = np.zeros(len(points), dtype=bool)
+    
+    # 为每个点找最佳可见相机并采样颜色
+    for cam_idx, cam in enumerate(cameras):
+        if cam_idx % 5 == 0:
+            print(f"  Processing camera {cam_idx+1}/{len(cameras)}...")
+        
+        # 构建w2c矩阵
+        R_w2c = cam.R.T  # cam.R存储的是R_w2c的转置
+        t_w2c = cam.T
+        
+        # 投影点到相机
+        points_cam = (R_w2c @ points.T).T + t_w2c
+        
+        # 过滤相机后方的点
+        valid_depth = points_cam[:, 2] > 0.01
+        
+        if not valid_depth.any():
+            continue
+        
+        # 投影到图像平面
+        fx = fov2focal(cam.FovX, cam.width)
+        fy = fov2focal(cam.FovY, cam.height)
+        cx = cam.width / 2 + cam.cx * cam.width / 2
+        cy = cam.height / 2 + cam.cy * cam.height / 2
+        
+        u = fx * points_cam[:, 0] / (points_cam[:, 2] + 1e-8) + cx
+        v = fy * points_cam[:, 1] / (points_cam[:, 2] + 1e-8) + cy
+        
+        # 检查是否在图像内
+        valid_u = (u >= 0) & (u < cam.width)
+        valid_v = (v >= 0) & (v < cam.height)
+        valid = valid_depth & valid_u & valid_v
+        
+        if not valid.any():
+            continue
+        
+        # 加载图像
+        image = np.array(cam.image).astype(np.float32) / 255.0
+        
+        # 双线性采样
+        valid_indices = np.where(valid)[0]
+        for idx in valid_indices:
+            if vis_mask[idx]:  # 已经有颜色了
+                continue
+            
+            ui, vi = int(u[idx]), int(v[idx])
+            # 简单的最近邻采样（避免越界）
+            ui = np.clip(ui, 0, cam.width - 1)
+            vi = np.clip(vi, 0, cam.height - 1)
+            
+            colors[idx] = image[vi, ui]
+            vis_mask[idx] = True
+    
+    # 未采样到的点用灰色
+    colors[~vis_mask] = 0.5
+    
+    print(f"  ✅ Filled colors: {vis_mask.sum()}/{len(points)} points visible")
+    print(f"  ⚠️  Gray fallback: {(~vis_mask).sum()} points")
+    
+    return BasicPointCloud(
+        points=points,
+        colors=colors,
+        normals=pcd.normals if hasattr(pcd, 'normals') else np.zeros_like(points)
+    )
+
+
+def readVGGTCamerasFromJSON(path, json_file="vggt_poses.json"):
+    """
+    Read camera parameters from VGGT exported JSON file.
+    
+    Args:
+        path: scene directory
+        json_file: JSON filename (default: "vggt_poses.json")
+    
+    Returns:
+        list of CameraInfo
+    
+    Note:
+        - VGGT exports w2c (world-to-camera) extrinsics
+        - JSON contains dual intrinsics (image size + depth size)
+        - Depth maps are in VGGT processing size (e.g., 518x518)
+        - Images are in original size (e.g., 2048x2048)
+    """
+    json_path = os.path.join(path, json_file)
+    
+    if not os.path.exists(json_path):
+        return None
+    
+    print(f"Reading VGGT poses from {json_file}")
+    
+    with open(json_path, 'r') as f:
+        data = json.load(f)
+    
+    # Verify format
+    metadata = data.get("metadata", {})
+    pose_type = metadata.get("pose_type", "")
+    
+    if pose_type != "w2c_opencv":
+        print(f"Warning: Expected pose_type='w2c_opencv', got '{pose_type}'")
+    
+    print(f"  Version: {metadata.get('version', 'unknown')}")
+    print(f"  Pose type: {pose_type}")
+    print(f"  FoV unit: {metadata.get('fov_unit', 'unknown')}")
+    
+    cam_infos = []
+    frames = data["frames"]
+    
+    for idx, frame in enumerate(frames):
+        # Read image
+        image_filename = frame["image_path"]
+        
+        # Try different path combinations
+        possible_paths = [
+            os.path.join(path, "images", image_filename),  # Standard: scene_dir/images/filename
+            os.path.join(path, image_filename),             # Direct: scene_dir/filename
+            image_filename                                   # Absolute path
+        ]
+        
+        image_path = None
+        for p in possible_paths:
+            if os.path.exists(p):
+                image_path = p
+                break
+        
+        if image_path is None:
+            raise FileNotFoundError(f"Could not find image: {image_filename}")
+        
+        image_name = Path(image_path).stem
+        image = Image.open(image_path)
+        
+        # Read intrinsics (use original image size intrinsics for rendering)
+        intr = frame["intrinsic"]
+        fx, fy = intr["fx"], intr["fy"]
+        cx, cy = intr["cx"], intr["cy"]
+        width, height = frame["width"], frame["height"]
+        
+        # Normalize principal point to [-1, 1]
+        cx_norm = (cx - width / 2) / width * 2
+        cy_norm = (cy - height / 2) / height * 2
+        
+        # Convert to FoV (Skyfall-GS uses FoV)
+        FovX = focal2fov(fx, width)
+        FovY = focal2fov(fy, height)
+        
+        # Read extrinsics (w2c format from VGGT)
+        extr = frame["extrinsic_w2c"]
+        R_w2c = np.array(extr["R"])  # 3x3 rotation matrix (world-to-camera)
+        t_w2c = np.array(extr["t"])  # 3x1 translation vector (world-to-camera)
+        
+        # CameraInfo storage convention (for CUDA compatibility):
+        # - R stores R_w2c.T (transposed world-to-camera rotation)
+        # - T stores t_w2c (world-to-camera translation)
+        # Usage:
+        # - To get w2c: R_w2c = cam.R.T, t_w2c = cam.T
+        # - To get c2w: R_c2w = cam.R, t_c2w = -cam.R @ cam.T
+        R = np.transpose(R_w2c)  # Store transposed for CUDA
+        T = t_w2c                # Store w2c translation
+        
+        # Read depth map (VGGT size, e.g., 518x518)
+        depth = None
+        depth_conf = None
+        
+        if "depth_path" in frame:
+            depth_path = os.path.join(path, frame["depth_path"])
+            if os.path.exists(depth_path):
+                depth = np.load(depth_path)
+        
+        if "depth_conf_path" in frame:
+            conf_path = os.path.join(path, frame["depth_conf_path"])
+            if os.path.exists(conf_path):
+                depth_conf = np.load(conf_path)
+        
+        # Read mask
+        mask_path = os.path.join(path, "masks", image_name + ".npy")
+        if os.path.exists(mask_path):
+            mask = np.load(mask_path)
+            mask = mask.astype(np.uint8)
+        else:
+            # Create binary mask: 0 if all pixels are (0,0,0), else 1
+            mask = 1 - np.all(np.array(image) == 0, axis=-1).astype(np.uint8)
+        
+        cam_info = CameraInfo(
+            uid=idx,
+            R=R,
+            T=T,
+            FovY=FovY,
+            FovX=FovX,
+            cx=cx_norm,
+            cy=cy_norm,
+            image=image,
+            image_path=image_path,
+            image_name=image_name,
+            depth=depth,
+            depth_conf=depth_conf,
+            mask=mask,
+            width=width,
+            height=height
+        )
+        cam_infos.append(cam_info)
+    
+    print(f"  Loaded {len(cam_infos)} cameras from VGGT")
+    
+    return cam_infos
+
+
 def readSatelliteInfo(path, white_background, eval, extension=".png"):
+    # Check for VGGT initialization first
+    vggt_json_path = os.path.join(path, "vggt_poses.json")
+    
+    if os.path.exists(vggt_json_path):
+        print("=" * 80)
+        print("Found vggt_poses.json - Using VGGT initialization")
+        print("=" * 80)
+        
+        # Read VGGT cameras
+        train_cam_infos = readVGGTCamerasFromJSON(path, "vggt_poses.json")
+        
+        if train_cam_infos is None:
+            print("Failed to read VGGT poses, falling back to transforms_train.json")
+        else:
+            # For VGGT, we don't have separate test set in the JSON
+            # Use the same approach as original: split or use all for training
+            test_cam_infos = []
+            
+            if not eval:
+                # Training mode: use all cameras
+                pass
+            else:
+                # Evaluation mode: could split here if needed
+                # For now, keep all in training
+                pass
+            
+            # Get normalization parameters
+            nerf_normalization = getNerfppNorm(train_cam_infos)
+            
+            # Load point cloud from VGGT with priority order:
+            # 1. Downsampled point cloud (if exists)
+            # 2. Original VGGT point cloud
+            # 3. Standard points3D.ply
+            # 4. Generate from depth maps (last resort)
+            
+            downsampled_ply = os.path.join(path, "vggt_points3d_downsampled.ply")
+            original_ply = os.path.join(path, "vggt_points3d.ply")
+            fallback_ply = os.path.join(path, "points3D.ply")
+            
+            ply_path = None
+            if os.path.exists(downsampled_ply):
+                ply_path = downsampled_ply
+                print(f"✅ Using downsampled point cloud: {downsampled_ply}")
+            elif os.path.exists(original_ply):
+                ply_path = original_ply
+                print(f"Using original VGGT point cloud: {original_ply}")
+            elif os.path.exists(fallback_ply):
+                ply_path = fallback_ply
+                print(f"Falling back to points3D.ply")
+            
+            # Load point cloud
+            if ply_path:
+                try:
+                    pcd = fetchPly(ply_path)
+                    print(f"Loaded {len(pcd.points)} points from {os.path.basename(ply_path)}")
+                    
+                    # 检查是否有颜色
+                    if not hasattr(pcd, 'colors') or pcd.colors is None or len(pcd.colors) == 0:
+                        print("[WARN] Point cloud has no colors!")
+                        print("[INFO] Filling colors from VGGT images...")
+                        pcd = fill_point_cloud_colors_from_images(pcd, train_cam_infos, path)
+                    else:
+                        print(f"  ✅ Point cloud has colors (range: [{pcd.colors.min():.3f}, {pcd.colors.max():.3f}])")
+                        
+                except Exception as e:
+                    print(f"Warning: Could not load point cloud from {ply_path}: {e}")
+                    print("Generating point cloud from VGGT depth maps...")
+                    pcd = generate_pcd_from_vggt_depth(train_cam_infos)
+            else:
+                print("No point cloud file found, generating from VGGT depth maps...")
+                pcd = generate_pcd_from_vggt_depth(train_cam_infos)
+            
+            scene_info = SceneInfo(point_cloud=pcd,
+                                 train_cameras=train_cam_infos,
+                                 test_cameras=test_cam_infos,
+                                 nerf_normalization=nerf_normalization,
+                                 ply_path=ply_path)
+            return scene_info
+    
+    # Original Skyfall-GS initialization (fallback)
+    print("=" * 80)
+    print("Using original Skyfall-GS initialization (transforms_train.json)")
+    print("=" * 80)
     print("Reading Training Transforms")
     train_cam_infos, R, T = readSatelliteCamerasFromTransforms(path, "transforms_train.json", white_background, extension)
     print("Reading Test Transforms")
@@ -563,11 +891,102 @@ def readSatelliteCamerasFromTransforms(path, transformsfile, white_background, e
                             image_path=image_path, 
                             image_name=image_name,
                             depth=depth,
+                            depth_conf=None,  # No confidence for MoGe depth
                             mask=mask,
                             width=image.size[0], 
                             height=image.size[1])
             )
     return cam_infos, R_fix, T_fix
+
+
+def generate_pcd_from_vggt_depth(cam_infos, conf_threshold=1.5):
+    """
+    Generate point cloud from VGGT depth maps.
+    
+    Args:
+        cam_infos: list of CameraInfo with VGGT depth and depth_conf
+        conf_threshold: confidence threshold for filtering points
+    
+    Returns:
+        BasicPointCloud
+    """
+    print(f"Generating point cloud from VGGT depth maps (conf > {conf_threshold})")
+    
+    all_points = []
+    all_colors = []
+    
+    for cam in cam_infos:
+        if cam.depth is None or cam.depth_conf is None:
+            continue
+        
+        depth = cam.depth
+        conf = cam.depth_conf
+        image = np.array(cam.image) / 255.0  # Normalize to [0, 1]
+        
+        H, W = depth.shape
+        
+        # Get intrinsics for depth size
+        # Note: depth is in VGGT size, need to use depth-size intrinsics
+        # For now, we'll compute from FoV
+        fx = W / (2 * np.tan(cam.FovX / 2))
+        fy = H / (2 * np.tan(cam.FovY / 2))
+        cx = W / 2
+        cy = H / 2
+        
+        # Create pixel grid
+        u, v = np.meshgrid(np.arange(W), np.arange(H))
+        
+        # Filter by confidence
+        valid_mask = conf > conf_threshold
+        
+        u_valid = u[valid_mask]
+        v_valid = v[valid_mask]
+        depth_valid = depth[valid_mask]
+        
+        # Unproject to camera coordinates
+        x_cam = (u_valid - cx) * depth_valid / fx
+        y_cam = (v_valid - cy) * depth_valid / fy
+        z_cam = depth_valid
+        
+        points_cam = np.stack([x_cam, y_cam, z_cam], axis=1)
+        
+        # Transform to world coordinates
+        # cam.R stores R_w2c.T (transposed), cam.T stores t_w2c
+        # To get c2w: R_c2w = cam.R (already transposed), t_c2w = -cam.R @ cam.T
+        R_c2w = cam.R  # This is R_w2c.T = R_c2w
+        t_c2w = -R_c2w @ cam.T
+        
+        points_world = (R_c2w @ points_cam.T).T + t_c2w
+        
+        # Get colors (need to resize image to depth size)
+        from PIL import Image as PILImage
+        image_resized = PILImage.fromarray((image * 255).astype(np.uint8)).resize((W, H), PILImage.BILINEAR)
+        image_resized = np.array(image_resized) / 255.0
+        
+        colors = image_resized[valid_mask]
+        
+        all_points.append(points_world)
+        all_colors.append(colors)
+    
+    if len(all_points) == 0:
+        print("Warning: No valid points generated from VGGT depth")
+        # Return empty point cloud
+        return BasicPointCloud(
+            points=np.zeros((0, 3)),
+            colors=np.zeros((0, 3)),
+            normals=np.zeros((0, 3))
+        )
+    
+    all_points = np.concatenate(all_points, axis=0)
+    all_colors = np.concatenate(all_colors, axis=0)
+    
+    print(f"Generated {len(all_points)} points from VGGT depth maps")
+    
+    return BasicPointCloud(
+        points=all_points,
+        colors=all_colors,
+        normals=np.zeros_like(all_points)
+    )
 
 def read_exr(filename: str) -> np.ndarray:
     """

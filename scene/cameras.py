@@ -53,8 +53,9 @@ class Camera(nn.Module):
         if gt_alpha_mask is not None:
             self.original_image *= gt_alpha_mask.to(self.data_device)
 
-        self.zfar = 100.0
-        self.znear = 0.01
+        # Adaptive z-range for satellite imagery (large depths)
+        self.zfar = 10000000.0  # 10,000 km for satellite scenes
+        self.znear = 1000.0  # 1 km minimum distance
 
         self.trans = trans
         self.scale = scale

@@ -58,12 +58,19 @@ def loadCam(args, id, cam_info, resolution_scale, is_testing=False, optimizing=F
         if resized_image_rgb.shape[1] == 4:
             loaded_mask = resized_image_rgb[3:4, ...]
 
-        return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
+        cam = Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                     FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
                     cx=cam_info.cx, cy=cam_info.cy,
                     image=gt_image, gt_alpha_mask=loaded_mask,
                     image_name=cam_info.image_name, uid=id, data_device=args.data_device,
                     depth=depth, mask=mask, optimizing=optimizing)
+        
+        # Add VGGT depth and confidence as attributes (if available)
+        if cam_info.depth_conf is not None:
+            cam.vggt_depth = cam_info.depth
+            cam.vggt_depth_conf = cam_info.depth_conf
+        
+        return cam
     else:
         resized_image_rgb = PILtoTorch(cam_info.image, cam_info.image.size)
         gt_image = resized_image_rgb[:3, ...]

@@ -18,9 +18,30 @@ import random
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
 
-def PILtoTorch(pil_image, resolution):
+def PILtoTorch(pil_image, resolution, convert_to_linear=True):
+    """
+    Convert PIL image to torch tensor
+    
+    Args:
+        pil_image: PIL Image
+        resolution: target resolution (width, height)
+        convert_to_linear: if True, convert from sRGB to linear color space
+                          (CRITICAL for correct training!)
+    
+    Returns:
+        torch tensor in [0, 1] range, linear color space if convert_to_linear=True
+    """
     resized_image_PIL = pil_image.resize(resolution)
     resized_image = torch.from_numpy(np.array(resized_image_PIL)) / 255.0
+    
+    # CRITICAL: Convert sRGB to linear for training
+    # This is the #1 cause of "PSNR stuck at ~4.7 dB"
+    if convert_to_linear:
+        threshold = 0.04045
+        low = resized_image / 12.92
+        high = ((resized_image + 0.055) / 1.055) ** 2.4
+        resized_image = torch.where(resized_image <= threshold, low, high)
+    
     if len(resized_image.shape) == 3:
         return resized_image.permute(2, 0, 1)
     else:
